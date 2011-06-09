@@ -26,11 +26,39 @@
 #include <grp.h>
 #include <errno.h>
 
+#include <sys/syscall.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+
+#include "PAProtocol.h"
+
 #if defined(HAVE_PRCTL)
 # include <sys/prctl.h>
 #endif
 
 #define ZYGOTE_LOG_TAG "Zygote"
+#define POWER_ARBITER_SOCKPATH "/data/power_arbiter"
+
+#define CINDER_MAX_NAMELEN 20
+
+#define CINDER_CAP_RESERVE_DRAW   0x1
+#define CINDER_CAP_RESERVE_MODIFY 0x2
+#define CINDER_CAP_ALL (CINDER_CAP_RESERVE_DRAW | CINDER_CAP_RESERVE_MODIFY)
+
+#define SYS_RESERVE_INFO 364
+#define SYS_ADD_RESERVE_CHILD_LIST 378
+#define SYS_DEL_RESERVE_CHILD_LIST 379
+#define SYS_NUM_CHILD_LIST_RESERVES 380
+#define SYS_GET_CHILD_LIST_RESERVE 381
+#define SYS_ROOT_RESERVE_ID 383
+
+const char *pa_uid_exists = "PowerArbiter: UID already exists.";
+const char *pa_invalid_input = "PowerArbiter: Invalid input for operation.";
+const char *pa_bad_permissions = "PowerArbiter: Bad permissions for operation.";
+const char *pa_failure = "PowerArbiter: Operation failed.";
+const char *pa_success = "PowerArbiter: Operation succeeded.";
+const char *pa_uid_not_found = "PowerArbiter: UID mapping not found.";
+const char *pa_unexpected_error = "PowerArbiter: Unexpected error condition";
 
 /* must match values in dalvik.system.Zygote */
 enum {
@@ -38,6 +66,361 @@ enum {
     DEBUG_ENABLE_CHECKJNI           = 1 << 1,
     DEBUG_ENABLE_ASSERT             = 1 << 2,
 };
+
+struct reserve_info {
+	int id;
+	long capacity, lifetime_input, lifetime_usage;
+	char name[CINDER_MAX_NAMELEN];
+
+	int num_users;
+
+	/* TODO: Implement # taps */
+	int num_process_taps;
+};
+
+long reserve_info(int reserve_id, struct reserve_info *info)
+{
+	return syscall(SYS_RESERVE_INFO, reserve_id, info);
+}
+
+long add_reserve_to_child_list(int reserve_id, unsigned int capabilities)
+{
+	return syscall(SYS_ADD_RESERVE_CHILD_LIST, reserve_id, capabilities);
+}
+
+
+long del_reserve_from_child_list(int reserve_id)
+{
+	return syscall(SYS_DEL_RESERVE_CHILD_LIST, reserve_id);
+}
+
+long num_child_list_reserves(void)
+{
+	return syscall(SYS_NUM_CHILD_LIST_RESERVES);
+}
+
+int get_child_list_reserve(long index)
+{
+	return syscall(SYS_GET_CHILD_LIST_RESERVE, index);
+}
+
+static void
+__format_error_str(int err, char *buf, int buflen)
+{
+	if (err < 0)
+		err *= -1;
+
+    strerror_r(err, buf, buflen);
+	buf[buflen - 1] = '\0';
+}
+
+static void
+__power_arbiter_response_to_str(uint32_t error, char *buf, int len)
+{
+    if (error == PA_UID_EXISTS) {
+		snprintf(buf, len, "%s", pa_uid_exists);
+    }
+    else if (error == PA_INVALID_INPUT) {
+		snprintf(buf, len, "%s", pa_invalid_input);
+    }
+    else if (error == PA_BAD_PERMISSIONS) {
+		snprintf(buf, len, "%s", pa_bad_permissions);
+    }
+    else if (error == PA_FAILURE) {
+		snprintf(buf, len, "%s", pa_failure);
+    }
+    else if (error == PA_NO_ERROR) {
+		snprintf(buf, len, "%s", pa_success);
+    }
+    else if (error == PA_UID_NOT_FOUND) {
+		snprintf(buf, len, "%s", pa_uid_not_found);
+    }
+    else {
+		snprintf(buf, len, "%s: %d", pa_unexpected_error, error);
+    }
+}
+
+int
+streamsock_read(int sock, uint8_t *buf, uint64_t bufsiz, uint64_t to_read,
+	uint64_t *num_bytes_read)
+{
+	int err;
+	ssize_t recv_ret;
+	uint8_t *buf_offset = buf;
+	uint64_t rcvd = 0, remaining = to_read;
+
+	if (sock == -1 || !buf || to_read > bufsiz || !num_bytes_read)
+		return -EINVAL;
+
+	while (rcvd < to_read) {
+		recv_ret = recv(sock, buf_offset, remaining, 0);
+		if (recv_ret == -1) {
+			// Error
+			err = errno;
+			return err;
+		}
+		if (recv_ret == 0) {
+			// Orderly shutdown
+			break;
+		}
+
+		rcvd += (uint64_t) recv_ret;
+		remaining -= (uint64_t) recv_ret;
+		buf_offset += (ptrdiff_t) recv_ret;
+	}
+
+	*num_bytes_read = rcvd;
+	printf("Read %lld bytes.\n", rcvd);
+	return 0;
+}
+
+int
+streamsock_send(int sock, const uint8_t *buf, uint64_t to_send,
+	uint64_t *num_bytes_sent)
+{
+	int err;
+	ssize_t send_ret;
+	const uint8_t *buf_offset = buf;
+	uint64_t sent = 0, remaining = to_send;
+
+	if (sock == -1 || !buf || !num_bytes_sent)
+		return -EINVAL;
+
+	while (sent < to_send) {
+		send_ret = send(sock, buf_offset, remaining, 0);
+		if (send_ret == -1) {
+			err = errno;
+			return err;
+		}
+
+		sent += (uint64_t) send_ret;
+		remaining -= (uint64_t) send_ret;
+		buf_offset += (ptrdiff_t) send_ret;
+	}
+
+	*num_bytes_sent = sent;
+	return 0;
+}
+
+static int
+__connect_to_arbiter(int *sock)
+{
+    int socket_fd, err;
+    struct sockaddr_un address;
+    socklen_t address_length;
+    char buffer[256];
+	char error_s[256];
+
+    socket_fd = socket(PF_UNIX, SOCK_STREAM, 0);
+    if(socket_fd < 0) {
+      err = errno;
+      perror("socket");
+      return err;
+    }
+
+    address.sun_family = AF_UNIX;
+    address_length = sizeof(address.sun_family) +
+                  sprintf(address.sun_path, POWER_ARBITER_SOCKPATH);
+
+	// TODO: Strict aliasing warning here regarding dereferencing type punned pointer
+    if(connect(socket_fd, (struct sockaddr *) &address, address_length) != 0) {
+        err = errno;
+		__format_error_str(err, error_s, sizeof(error_s));
+		LOG(LOG_DEBUG, ZYGOTE_LOG_TAG, "Error connecting to power arbiter: [%s]\n",
+                    error_s);
+        return err;
+    }
+
+    *sock = socket_fd;
+    return 0;
+}
+
+static int
+__get_reserve_id_for_uid(uid_t uid, int socket_fd, int *rsv_id, int *use_root)
+{
+	int ret;
+	PAStatReserveQuery query;
+    PAStatReserveResponse response;
+    PARequest requestType;
+    uint64_t num_transferred;
+	char error_s[256];
+
+    // First set up packet
+    query.uid = uid;
+    requestType.request_type = PA_STAT_RESERVE;
+
+    // Send request
+    ret = streamsock_send(socket_fd, (uint8_t *)&requestType, sizeof(requestType),
+        &num_transferred);
+    if (ret || num_transferred != sizeof(requestType)) {
+		__format_error_str(ret, error_s, sizeof(error_s));
+		LOG(LOG_DEBUG, ZYGOTE_LOG_TAG, "Error sending bytes to power arbiter: [%s]\n",
+                    error_s);
+        return ret;
+    }
+
+    ret = streamsock_send(socket_fd, (uint8_t *)&query, sizeof(query),
+        &num_transferred);
+    if (ret || num_transferred != sizeof(query)) {
+		__format_error_str(ret, error_s, sizeof(error_s));
+		LOG(LOG_DEBUG, ZYGOTE_LOG_TAG, "Error sending bytes to power arbiter: [%s]\n",
+                    error_s);
+        return ret;
+    }
+
+    // Get response
+    ret = streamsock_read(socket_fd, (uint8_t *)&response, sizeof(response), sizeof(response),
+        &num_transferred);
+    if (ret || num_transferred != sizeof(response)) {
+		__format_error_str(ret, error_s, sizeof(error_s));
+		LOG(LOG_DEBUG, ZYGOTE_LOG_TAG, "Error receiving bytes from power arbiter: [%s]\n",
+                    error_s);
+        return ret;
+    }
+
+	// Log response
+	__power_arbiter_response_to_str(response.error, error_s, sizeof(error_s));
+	LOG(LOG_DEBUG, ZYGOTE_LOG_TAG, "Power Arbiter response: [%s]\n",
+                    error_s);
+
+	// Parse response
+	if (response.error == PA_NO_ERROR) {
+        if (response.flags & PA_USE_ROOT_RESERVE) {
+            *use_root = 1;
+        }
+        else if (response.flags & PA_RESERVE_GRANTED) {
+			// Note this is the only case where rsv_id is valid
+			*use_root = 0;
+			*rsv_id = response.rid;
+        }
+        else {
+			LOG(LOG_DEBUG, ZYGOTE_LOG_TAG, "Power Arbiter response has bad flags: %d\n",
+                    response.flags);
+            *use_root = 1;
+        }
+    }
+	else {
+		// Some error occurred remotely
+		LOG(LOG_DEBUG, ZYGOTE_LOG_TAG, "PowerArbiter operation failed\n");
+		*use_root = 1;
+	}
+	// Done.
+	return 0;
+}
+
+static int
+__verify_reserve_access(int reserve_id)
+{
+	int err;
+	char error_s[256];
+	struct reserve_info rsv_info;
+
+	err = (int) reserve_info(reserve_id, &rsv_info);
+	if (err) {
+		__format_error_str(err, error_s, sizeof(error_s));
+		LOG(LOG_DEBUG, ZYGOTE_LOG_TAG, "Verification of reserve access failed for RID %d : [%s]\n",
+			reserve_id, error_s);
+	}
+	return err;
+}
+
+static int
+__clear_child_reserve_list()
+{
+	int err, reserve_id;
+
+	while (num_child_list_reserves() > 0) {
+		reserve_id = get_child_list_reserve(0);
+		if (reserve_id < 0)
+			return reserve_id;
+
+		err = (int) del_reserve_from_child_list(reserve_id);
+		if (err)
+			return err;
+	}
+
+	return 0;
+}
+
+static void
+__cinder_reset_child_reserves()
+{
+	int err, root_reserve_id;
+
+	// Get root reserve ID. This call cannot fail.
+	root_reserve_id = syscall(SYS_ROOT_RESERVE_ID);
+
+	// Remove all reserves from child list
+	err = __clear_child_reserve_list();
+	if (err) {
+		LOG(LOG_DEBUG, ZYGOTE_LOG_TAG, "Unable to reset child reserves for zygote.\n");
+	}
+
+	// Place root reserve onto child list
+	err = (int) add_reserve_to_child_list(root_reserve_id, CINDER_CAP_ALL);
+	if (err) {
+		LOG(LOG_DEBUG, ZYGOTE_LOG_TAG, "Unable to readd root reserve to zygote child list.\n");
+	}
+}
+
+static void
+__cinder_setup_child_reserves(uid_t uid, int *used_root)
+{
+	int socket_fd, err, reserve_id, use_root = 1;
+
+	// By default we use root
+	*used_root = 1;
+
+	// Connect to arbiter
+	err = __connect_to_arbiter(&socket_fd);
+	if (err) {
+		LOG(LOG_DEBUG, ZYGOTE_LOG_TAG, "Connection to power arbiter failed."
+                    " Should use root reserve for child.\n");
+		return;
+	}
+
+	// Get access to child reserve for UID
+	err = __get_reserve_id_for_uid(uid, socket_fd, &reserve_id, &use_root);
+	if (err) {
+		LOG(LOG_DEBUG, ZYGOTE_LOG_TAG, "Unable to get reserve ID for UID %d."
+                    " Should use root reserve for child.\n", uid);
+		return;
+	}
+	if (use_root) {
+		LOG(LOG_DEBUG, ZYGOTE_LOG_TAG, "Using root reserve for UID %d.\n", uid);
+		return;
+	}
+
+	// Verify we have access to reserve
+	err = __verify_reserve_access(reserve_id);
+	if (err) {
+		LOG(LOG_DEBUG, ZYGOTE_LOG_TAG, "Unable to access reserve %d for UID %d.\n",
+			reserve_id, uid);
+		return;
+	}
+
+	// Clear child reserve list
+	err = __clear_child_reserve_list();
+	if (err) {
+		LOG(LOG_DEBUG, ZYGOTE_LOG_TAG, "Unable to clear child reserves for UID %d.\n",
+			uid);
+		return;
+	}
+
+	// Add reserve to child reserve list
+	err = (int) add_reserve_to_child_list(reserve_id, CINDER_CAP_ALL);
+	if (err) {
+		LOG(LOG_DEBUG, ZYGOTE_LOG_TAG, "Unable to add reserve for UID %d.\n",
+			uid);
+		__cinder_reset_child_reserves();
+		return;
+	}
+	*used_root = 0;
+
+	// All done.
+	LOG(LOG_DEBUG, ZYGOTE_LOG_TAG, "Successfully set reserve when forking for UID %d.\n",
+			uid);
+}
 
 /*
  * This signal handler is for zygote mode, since the zygote
@@ -293,6 +676,7 @@ static void enableDebugFeatures(u4 debugFlags)
 static pid_t forkAndSpecializeCommon(const u4* args)
 {
     pid_t pid;
+	int used_root = 1;
 
     uid_t uid = (uid_t) args[0];
     gid_t gid = (gid_t) args[1];
@@ -315,6 +699,7 @@ static pid_t forkAndSpecializeCommon(const u4* args)
     setSignalHandler();      
 
     dvmDumpLoaderStats("zygote");
+	__cinder_setup_child_reserves(uid, &used_root);
     pid = fork();
 
     if (pid == 0) {
@@ -375,6 +760,9 @@ static pid_t forkAndSpecializeCommon(const u4* args)
         }
     } else if (pid > 0) {
         /* the parent process */
+		if (!used_root) {
+			__cinder_reset_child_reserves();
+		}
     }
 
     return pid;
